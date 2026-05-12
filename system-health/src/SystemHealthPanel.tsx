@@ -43,13 +43,24 @@ interface CachedStatus {
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-type ModuleMode = "diagnostics" | "heartbeat";
+type ModuleMode = "diagnostics" | "heartbeat" | "diag-name" | "diag-hardware-id";
 
 interface ModuleConfig {
   id: string;
   label: string;
-  topics: string; // comma-separated
+  topics: string; // comma-separated, used by diagnostics/heartbeat modes
   mode: ModuleMode;
+  // diag-name mode
+  diagName?: string;
+  valueKey?: string;
+  // diag-hardware-id mode
+  hardwareId?: string;
+  primarySubName?: string;
+  primaryKey?: string;
+  primarySubLabel?: string;
+  secondarySubName?: string;
+  secondaryKey?: string;
+  secondarySubLabel?: string;
 }
 
 interface PanelConfig {
@@ -82,6 +93,7 @@ type StatusLevel = "ok" | "warn" | "error" | "stale" | "unknown";
 interface ModuleState {
   status: StatusLevel;
   value: string;
+  value2?: string;
 }
 
 const DEFAULT_STATE: ModuleState = { status: "unknown", value: "—" };
@@ -173,6 +185,9 @@ const Badge = memo(function Badge({
         {label}
       </span>
       <span style={{ fontSize: fs(10), color: "#888", lineHeight: 1 }}>{state.value}</span>
+      {state.value2 != null && (
+        <span style={{ fontSize: fs(10), color: "#888", lineHeight: 1 }}>{state.value2}</span>
+      )}
     </div>
   );
 });
@@ -182,34 +197,94 @@ const Badge = memo(function Badge({
 function buildSettingsTree(config: PanelConfig): SettingsTree["nodes"] {
   const moduleChildren: Record<string, SettingsTreeNode> = {};
   config.modules.forEach((mod) => {
+    const modeFields: SettingsTreeNode["fields"] = {
+      label: { label: "Label", input: "string", value: mod.label },
+      mode: {
+        label: "Mode",
+        input: "select",
+        value: mod.mode,
+        options: [
+          { label: "Diagnostics", value: "diagnostics" },
+          { label: "Heartbeat", value: "heartbeat" },
+          { label: "Diag by name", value: "diag-name" },
+          { label: "Diag by hardware_id", value: "diag-hardware-id" },
+        ],
+      },
+    };
+
+    if (mod.mode === "diagnostics" || mod.mode === "heartbeat") {
+      modeFields.topics = {
+        label: "Topics (comma-separated)",
+        input: "string",
+        value: mod.topics,
+        help:
+          mod.mode === "diagnostics"
+            ? 'Looked up as "<prefix>: <topic>" in /diagnostics. Multiple topics use the best (lowest) level.'
+            : "Module is OK whenever any message arrives on these topics.",
+      };
+    }
+
+    if (mod.mode === "diag-name") {
+      modeFields.diagName = {
+        label: "Diagnostic name",
+        input: "string",
+        value: mod.diagName ?? "",
+        help: 'Exact name field of the diagnostic entry, e.g. "ram_monitor: RAM Information"',
+      };
+      modeFields.valueKey = {
+        label: "Value key",
+        input: "string",
+        value: mod.valueKey ?? "",
+        help: 'Key in values[] to display, e.g. "RAM Load Average"',
+      };
+    }
+
+    if (mod.mode === "diag-hardware-id") {
+      modeFields.hardwareId = {
+        label: "hardware_id",
+        input: "string",
+        value: mod.hardwareId ?? "",
+        help: "Filter diagnostic entries by this hardware_id. Worst level across all matches is shown.",
+      };
+      modeFields.primarySubName = {
+        label: "Primary entry name",
+        input: "string",
+        value: mod.primarySubName ?? "",
+        help: 'Name of the entry to read the primary value from, e.g. "lanes"',
+      };
+      modeFields.primaryKey = {
+        label: "Primary value key",
+        input: "string",
+        value: mod.primaryKey ?? "",
+        help: 'Key in values[] for the primary value, e.g. "delay"',
+      };
+      modeFields.primarySubLabel = {
+        label: "Primary label prefix",
+        input: "string",
+        value: mod.primarySubLabel ?? "",
+        help: 'Short prefix shown before the value, e.g. "L"',
+      };
+      modeFields.secondarySubName = {
+        label: "Secondary entry name",
+        input: "string",
+        value: mod.secondarySubName ?? "",
+      };
+      modeFields.secondaryKey = {
+        label: "Secondary value key",
+        input: "string",
+        value: mod.secondaryKey ?? "",
+      };
+      modeFields.secondarySubLabel = {
+        label: "Secondary label prefix",
+        input: "string",
+        value: mod.secondarySubLabel ?? "",
+      };
+    }
+
     moduleChildren[mod.id] = {
       label: mod.label || "Module",
       actions: [{ type: "action" as const, id: `remove-${mod.id}`, label: "Remove" }],
-      fields: {
-        label: { label: "Label", input: "string", value: mod.label },
-        topics: {
-          label: "Topics (comma-separated)",
-          input: "string",
-          value: mod.topics,
-          help: "One or more ROS topic names. Multiple topics are treated as alternates — the best status wins.",
-        },
-        mode: {
-          label: "Mode",
-          input: "select",
-          value: mod.mode,
-          options: [
-            {
-              label: "Diagnostics",
-              value: "diagnostics",
-            },
-            {
-              label: "Heartbeat",
-              value: "heartbeat",
-            },
-          ],
-          help: 'Diagnostics: reads status from /diagnostics using "<prefix>: <topic>" entries. Heartbeat: marks OK whenever any message arrives on the topic.',
-        },
-      },
+      fields: modeFields,
     };
   });
 
@@ -418,6 +493,55 @@ function SystemHealthPanel({ context }: { context: PanelExtensionContext }): Rea
             if (nowSec - entry.lastSeenSec > cfg.diagCacheTimeoutSec) cache.delete(key);
           }
 
+          // ── diag-name mode ────────────────────────────────────────────────
+          for (const mod of cfg.modules) {
+            if (mod.mode !== "diag-name" || !mod.diagName) continue;
+            const entry = cache.get(mod.diagName);
+            if (entry != null) {
+              heartbeats[mod.label] = now;
+              const update: Partial<ModuleState> = { status: diagLevelToStatus(entry.level) };
+              if (mod.valueKey) {
+                const raw = entry.values.find((v) => v.key === mod.valueKey)?.value;
+                if (raw != null) update.value = raw;
+              }
+              patch(mod.label, update);
+            }
+          }
+
+          // ── diag-hardware-id mode ─────────────────────────────────────────
+          for (const mod of cfg.modules) {
+            if (mod.mode !== "diag-hardware-id" || !mod.hardwareId) continue;
+            let worstLevel = -1;
+            let primaryVal: string | undefined;
+            let secondaryVal: string | undefined;
+            let seen = false;
+
+            for (const entry of cache.values()) {
+              if (entry.hardware_id !== mod.hardwareId) continue;
+              seen = true;
+              if (entry.level > worstLevel) worstLevel = entry.level;
+              if (mod.primarySubName && entry.name === mod.primarySubName && mod.primaryKey) {
+                primaryVal = entry.values.find((v) => v.key === mod.primaryKey)?.value;
+              }
+              if (mod.secondarySubName && entry.name === mod.secondarySubName && mod.secondaryKey) {
+                secondaryVal = entry.values.find((v) => v.key === mod.secondaryKey)?.value;
+              }
+            }
+
+            if (seen) {
+              heartbeats[mod.label] = now;
+              const update: Partial<ModuleState> = { status: diagLevelToStatus(worstLevel) };
+              if (primaryVal != null)
+                update.value = mod.primarySubLabel ? `${mod.primarySubLabel}: ${primaryVal}` : primaryVal;
+              if (secondaryVal != null)
+                update.value2 = mod.secondarySubLabel
+                  ? `${mod.secondarySubLabel}: ${secondaryVal}`
+                  : secondaryVal;
+              patch(mod.label, update);
+            }
+          }
+
+          // ── diagnostics mode ──────────────────────────────────────────────
           for (const mod of cfg.modules) {
             if (mod.mode !== "diagnostics") continue;
             const topicList = mod.topics
